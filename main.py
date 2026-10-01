@@ -1,15 +1,18 @@
 import asyncio
+from pydantic import BaseModel
 import sqlite3
 from datetime import datetime
 from pathlib import Path
-
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse
+from fastapi import FastAPI, HTTPException, Body
+from fastapi.responses import FileResponse, JSONResponse
 
 from pdf_generator import generate_pdf
 
 
 app = FastAPI()
+
+class ReportRequest(BaseModel):
+    force: bool = False
 
 DB_NAME = "report.db"
 REPORTS_DIR = Path("reports")
@@ -39,36 +42,65 @@ async def health():
     return {"status": "ok"}
 
 
-@app.post("/reports", status_code=201)
-async def create_report():
+@app.post("/reports")
+async def create_report(
+    report_request: ReportRequest = Body(default=ReportRequest())
+):
+    force = report_request.force
     conn = sqlite3.connect(DB_NAME)
+    conn.row_factory = sqlite3.Row
 
-    cursor = conn.execute("""
+    if not force:
+        existing = conn.execute(
+            """
+            SELECT id, path, created_at
+            FROM reports
+            WHERE date(created_at) = date('now', 'localtime')
+            ORDER BY id DESC
+            LIMIT 1
+            """
+        ).fetchone()
+
+        if existing:
+            report_id = existing["id"]
+            conn.close()
+
+            return JSONResponse(
+                status_code=200,
+                content={
+                    "id": report_id,
+                    "file": f"/reports/{report_id}/file"
+                }
+            )
+
+    cursor = conn.execute(
+        """
         INSERT INTO reports (path, created_at)
         VALUES (?, ?)
-    """, ("", datetime.now().isoformat()))
+        """,
+        ("", datetime.now().isoformat())
+    )
 
     report_id = cursor.lastrowid
-
     file_path = REPORTS_DIR / f"{report_id}.pdf"
 
-    conn.execute("""
-        UPDATE reports
-        SET path = ?
-        WHERE id = ?
-    """, (str(file_path), report_id))
+    conn.execute(
+        "UPDATE reports SET path = ? WHERE id = ?",
+        (str(file_path), report_id)
+    )
 
     conn.commit()
     conn.close()
 
     await asyncio.to_thread(generate_pdf, file_path)
 
-    return {
-        "id": report_id,
-        "file": f"/reports/{report_id}/file"
-    }
-
-
+    return JSONResponse(
+        status_code=201,
+        content={
+            "id": report_id,
+            "file": f"/reports/{report_id}/file"
+        }
+    )
 @app.get("/reports/{report_id}")
 async def get_report(report_id: int):
     conn = sqlite3.connect(DB_NAME)
